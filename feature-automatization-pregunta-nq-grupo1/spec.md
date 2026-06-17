@@ -24,7 +24,7 @@ La automatización permitirá mantener un banco constantemente abastecido, reduc
 
 ## US-1 (P1)
 
-# HU-A: Orquestar envío automático de preguntas faltantes hacia NQ
+# HU-1: Orquestar envío automático de preguntas faltantes hacia NQ
 
 ## Contexto
 
@@ -133,8 +133,102 @@ Atributos enviados:
 **IF** la API de NQ no responde correctamente
 **THEN THE SYSTEM SHALL** registrar el intento fallido y mantener el registro en estado pendiente para su posterior reprocesamiento.
 
+---
+# HU-2: Validar duplicidad y almacenar preguntas generadas provenientes de NQ
+
+## Contexto
+
+Una vez que NQ genera automáticamente nuevas preguntas a partir de solicitudes enviadas por Lumeria, es necesario validar que estas preguntas no existan previamente dentro del banco de preguntas.
+
+Actualmente Lumeria ya cuenta con una funcionalidad de validación de duplicidad, por lo que se requiere integrarla automáticamente al flujo para asegurar que únicamente preguntas válidas continúen hacia la tabla temporal de revisión.
 
 ---
+
+## Valor
+
+Evita el ingreso de preguntas duplicadas al flujo de revisión docente asegurando calidad del banco de preguntas y reduciendo reprocesamientos manuales.
+
+---
+
+## Descripción
+
+El sistema debe recibir automáticamente las preguntas generadas por NQ, ejecutar validación de duplicidad utilizando el mecanismo existente en Lumeria y almacenar únicamente las preguntas válidas en la tabla temporal de revisión.
+
+Si durante la validación se detectan preguntas duplicadas, el sistema deberá solicitar automáticamente nuevas preguntas a NQ hasta completar la cantidad requerida originalmente.
+
+---
+
+## Rol
+
+Administrador
+
+---
+
+## Alcance
+
+* Recepción automática de preguntas generadas desde NQ
+* Validación automática de duplicidad en Lumeria
+* Reenvío automático a NQ en caso de duplicados
+* Almacenamiento en tabla temporal existente
+
+---
+
+## Criterios de Aceptación
+
+### 1. Recepción automática de preguntas
+
+**WHEN** NQ retorne preguntas generadas
+**THE SYSTEM SHALL** recibir automáticamente la respuesta e iniciar el flujo de validación interna.
+
+---
+
+### 2. Validación automática de duplicidad
+
+**WHEN** se reciban preguntas generadas desde NQ
+**THE SYSTEM SHALL** ejecutar automáticamente la validación de duplicidad utilizando la lógica actualmente existente en Lumeria.
+
+---
+
+### 3. Descarte automático de duplicados
+
+**IF** una pregunta recibida es identificada como duplicada
+**THEN THE SYSTEM SHALL** excluir automáticamente dicha pregunta del proceso de almacenamiento.
+
+---
+
+### 4. Solicitud automática de reposición
+
+**IF** durante la validación existan preguntas descartadas por duplicidad
+**THEN THE SYSTEM SHALL** generar automáticamente una nueva solicitud hacia NQ solicitando únicamente la cantidad faltante hasta completar el volumen originalmente requerido.
+
+---
+
+### 5. Reenvío bajo regla de bloques
+
+**WHEN** se solicite reposición de preguntas descartadas
+**THE SYSTEM SHALL** enviar solicitudes respetando el límite máximo de 5 preguntas por transacción definido por el flujo actual de NQ.
+
+---
+
+### 6. Almacenamiento de preguntas válidas
+
+**WHEN** una pregunta supere exitosamente la validación de duplicidad
+**THE SYSTEM SHALL** almacenarla automáticamente en la tabla temporal actualmente utilizada para revisión docente.
+
+---
+
+### 7. Conservación del flujo actual
+
+**WHILE** las preguntas permanezcan en estado pendiente de revisión
+**THE SYSTEM SHALL** mantener el flujo actual existente de revisión docente previo al ingreso definitivo al banco de preguntas.
+
+---
+
+### 8. Reintento automático hasta completar cantidad requerida
+
+**WHILE** la cantidad de preguntas válidas almacenadas sea menor a la cantidad originalmente solicitada
+**THE SYSTEM SHALL** continuar solicitando automáticamente nuevas preguntas a NQ hasta completar el total requerido.
+
 
 # 3. Requisitos No Funcionales (NFR)
 
