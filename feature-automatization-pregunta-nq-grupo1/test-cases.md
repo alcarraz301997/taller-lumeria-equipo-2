@@ -341,7 +341,79 @@ Las pruebas se ejecutan en entornos aislados. La API de NQ se simula (mocks) par
 
 ---
 
-## 8. Matriz de Trazabilidad
+## 8. Recovery & Resilience
+
+### TC-23 · Stale job recovery — scheduled command libera PROCESSING zombies
+
+| Atributo | Valor |
+|----------|-------|
+| Prioridad | P2 |
+| Traces To | NFR-3 / Constitution Art. 3 |
+
+**Given:** Faltante `F1` en estado `PROCESSING` hace más de 30 minutos (worker crash por OOM, deploy, timeout).
+**When:** Scheduled command `faltantes:recover-stale` se ejecuta (cada 5 minutos).
+**Then:** El comando ejecuta `UPDATE faltantes SET estado = 'PENDING' WHERE estado = 'PROCESSING' AND updated_at < NOW() - INTERVAL '30 minutes'`. `F1` vuelve a `PENDING` sin modificar `retry_count`. El worker pickup normal lo retoma.
+**Verification:** `SELECT estado FROM faltantes WHERE id = F1` → `PENDING`. `NQClient::post` invocado 1 vez post-recovery (no antes). Log contiene entry con `action = 'stale_recovery'` y `faltante_id = F1`.
+
+---
+
+### TC-24 · NQ devuelve menos preguntas de las solicitadas — éxito parcial + reposición
+
+| Atributo | Valor |
+|----------|-------|
+| Prioridad | P2 |
+| Traces To | HU-2, AC-4 |
+
+**Given:** Bloque de 5 preguntas enviado a NQ. NQ responde `HTTP 200` con 3 preguntas válidas (sin error).
+**When:** Sistema recibe las 3 preguntas, las valida estructuralmente y de duplicidad.
+**Then:** Las 3 preguntas se insertan en tabla temporal. `generated_quantity += 3`. `pending_quantity` se reduce en 3. Como `pending_quantity > 0`, el sistema dispara reposición por las 2 preguntas faltantes. No se trata como error.
+**Verification:** `generated_quantity = 3` tras el bloque. `NQClient::post` invocado 1 vez (bloque original) + 1 vez (reposición por 2). `reposition_cycles = 1`.
+
+---
+
+### TC-25 · PARTIAL + error NQ en reposición incrementa reposition_cycles
+
+| Atributo | Valor |
+|----------|-------|
+| Prioridad | P2 |
+| Traces To | Plan §1 (reposición con 3 ciclos máx) |
+
+**Given:** Faltante `F1` en `PARTIAL` con `reposition_cycles = 1`, `pending_quantity = 2`.
+**When:** La reposición envía solicitud a NQ y recibe `HTTP 500`.
+**Then:** `reposition_cycles` se incrementa a 2 (el ciclo fallido cuenta contra el límite de 3). El registro vuelve a `PENDING` conservando `reposition_cycles = 2`. Si en el siguiente procesamiento el error persiste → `reposition_cycles = 3` → `FAILED` con motivo `max_reposition_cycles_exceeded`.
+**Verification:** `SELECT reposition_cycles FROM faltantes WHERE id = F1` = 2 tras el error. En estado `PENDING` con `reposition_cycles` intacto.
+
+---
+
+### TC-26 · Máximo 3 reintentos por ciclo para error NQ 5xx
+
+| Atributo | Valor |
+|----------|-------|
+| Prioridad | P2 |
+| Traces To | HU-1, AC-8 / Plan §4 (reintentos) |
+
+**Given:** NQ responde `HTTP 500` en cada intento dentro de un mismo ciclo de procesamiento.
+**When:** Worker inicia procesamiento → intento 1 (500) → intento 2 (500) → intento 3 (500).
+**Then:** Tras 3 reintentos fallidos en este ciclo, el sistema NO reintenta una 4ª vez. El registro vuelve a `PENDING` con `retry_count = 3`. El worker pickup en el siguiente ciclo comenzará de nuevo con 3 reintentos frescos.
+**Verification:** `NQClient::post` invocado exactamente 3 veces en este ciclo. `retry_count = 3`. Estado = `PENDING`. No hay un 4º intento en el mismo ciclo.
+
+---
+
+### TC-27 · Cache de respuesta NQ ante fallo de BD — evita doble consumo de créditos
+
+| Atributo | Valor |
+|----------|-------|
+| Prioridad | P2 |
+| Traces To | TC-13 / Plan §2 (integridad) |
+
+**Given:** NQ responde con 5 preguntas válidas (`HTTP 200`). La transacción de inserción en tabla temporal falla (BD caída).
+**When:** El sistema captura la excepción de BD y ejecuta rollback.
+**Then:** El sistema persiste la respuesta de NQ en Redis asociada al `faltante_id` con TTL de 24h (`cache:nq_response:{faltante_id}`). El faltante vuelve a `PENDING`. En el reintento, el sistema verifica si existe respuesta cacheada antes de llamar a NQ. Si existe, reusa la respuesta sin consumir créditos NQ.
+**Verification:** En el reintento, `NQClient::post` NO es invocado. Las 5 preguntas se insertan desde caché. `generated_quantity = 5`. `SELECT COUNT(*) FROM preguntas_temporal WHERE faltante_id = F1` = 5.
+
+---
+
+## 9. Matriz de Trazabilidad
 
 | Requisito | TC asociado | Estado |
 |-----------|-------------|--------|
@@ -384,14 +456,17 @@ Las pruebas se ejecutan en entornos aislados. La API de NQ se simula (mocks) par
 | Rotura-9 — División reposición > 5 | TC-20 | ✅ |
 | Rotura-10 — Ciclos de estado alternos | TC-16 | ✅ |
 | Rotura-14 — Sanitización contenido NQ | TC-21 | ✅ |
+| Rotura-4 — Stale job recovery | TC-23 | ✅ |
+| NQ devuelve menos preguntas de las solicitadas | TC-24 | ✅ |
+| PARTIAL + error NQ incrementa reposition_cycles | TC-25 | ✅ |
+| Máximo 3 reintentos por ciclo NQ 5xx | TC-26 | ✅ |
+| Cache respuesta NQ en fallo BD | TC-27 | ✅ |
 
 ---
 
 ## Notas para el equipo
 
-- **Rotura-4 (stale jobs):** Fuera de scope según decisión del equipo. Si un worker muere en `PROCESSING`, el registro queda en ese estado sin recuperación automática. Considerar un scheduled command en futuras iteraciones.
-- **Rotura-11 (NEEDS_CLARIFICATION obsoleto):** El spec §6 aún lista 3 preguntas como no resueltas, pero los ACs de HU-1 y HU-2 ya las responden (5 por bloque, acumulativos, cola FIFO). Se recomienda actualizar `spec.md` §6 para eliminar la contradicción.
-- **Rotura-12 (banco vs tabla temporal):** Confirmado: las preguntas van a la tabla temporal (banco IA pre-Lumeria), no directo al banco final. HU-2 y plan son la fuente canónica. Se recomienda corregir spec §7 (Scope IN) que dice "inserción dentro del banco".
+- **Rotura-4 (stale jobs):** Mitigado mediante scheduled command `faltantes:recover-stale`. Comando programado (cron) ejecutado cada 5 minutos detecta faltantes en `PROCESSING` con `updated_at > 30 min` y los devuelve a `PENDING` (ver TC-23).
 - **Rotura-13 (HTTP response al usuario):** El endpoint de generación de material es preexistente y no forma parte de esta implementación.
 
 ---
