@@ -33,12 +33,18 @@ Las pruebas se estructuran con un enfoque **basado en riesgos y trazabilidad**:
 
 ### Qué quedó sin cubrir
 
-Aunque los 31 casos de prueba cubren exhaustivamente los requisitos funcionales, de negocio y las roturas detectadas, se identifican las siguientes áreas sin cobertura explícita en este plan:
+Aunque los 27 casos de prueba cubren exhaustivamente los requisitos funcionales, de negocio y las roturas detectadas, se identifican las siguientes áreas sin cobertura explícita en este plan:
 
+- **Pruebas de carga/volumen:** No existen TC para escenarios de alto volumen (miles de faltantes pendientes simultáneos) ni pruebas de estrés sobre la cola Redis. El plan de riesgos menciona "alto volumen de faltantes pendientes" como riesgo identificado (plan.md:177), y la constitución exige al menos un TC de carga/volumen (constitution.md:82). Se creará TC-32 en Fase 2.
+- **Timeout de NQ como error independiente:** El plan técnico menciona "timeout" junto con HTTP 5xx como errores de NQ, pero TC-11 solo cubre explícitamente HTTP 500. No hay un TC específico para `connection timeout` o `read timeout` del cliente HTTP hacia NQ. La constitución exige cobertura de timeout (constitution.md:89). Se creará TC-29 en Fase 2.
+- **Rate limiting de NQ (HTTP 429):** No se contempla el escenario donde NQ responde con HTTP 429 (Too Many Requests) ni cómo el sistema debe reaccionar (backoff, respetar header `Retry-After`). Se creará TC-31 en Fase 2.
+- **HTTP 4xx → FAILED inmediato:** La constitución exige cobertura de 4xx como error independiente con FAILED sin reintento (constitution.md:90). TC-11 solo cubre 5xx. Se creará TC-28 en Fase 2.
+- **Comportamiento del sistema ante 401/403:** TC-18 verifica que `ODISEO_KEY` no se expone en logs durante un 401, pero no existe un TC que defina el comportamiento completo del sistema ante credenciales inválidas o expiradas (transición de estado, reintentos, registro de auditoría). Esto se incluirá dentro de TC-28 (Fase 2).
 - **Stale job en estado PARTIAL:** TC-23 cubre la recuperación de trabajos zombies en estado PROCESSING (> 30 min), pero no contempla explícitamente un worker que muere mientras el faltante está en PARTIAL. El scheduled command `faltantes:recover-stale` solo actúa sobre `PROCESSING`.
-- **Notificación/alertas de estados FAILED:** No existen TC para verificar que el sistema notifique o alerte (email, dashboard, webhook) cuando un faltante transita a FAILED (ej. `max_reposition_cycles_exceeded`, `curso no habilitado`). La trazabilidad se limita a logs y registros en BD.
-- **Fallo de autenticación NQ (HTTP 401/403):** TC-18 verifica que `ODISEO_KEY` no se expone en logs durante un 401, pero no existe un TC que defina el comportamiento completo del sistema ante credenciales inválidas o expiradas como escenario de error independiente (transición de estado, reintentos, registro de auditoría).
-- **Migración de datos preexistentes:** No se cubre el comportamiento del sistema con registros de faltantes creados antes de la activación de esta funcionalidad. ¿Deben procesarse retroactivamente o solo aplica a nuevos registros?
+- **Indisponibilidad de Redis:** TC-27 asume Redis disponible para cachear respuestas de NQ ante fallo de BD. La constitución exige cobertura de indisponibilidad de Redis (cola) (constitution.md:76). No existe TC que cubra qué sucede si Redis no está disponible durante la operación de caché o durante la operación normal de la cola. Se creará TC-30 en Fase 2.
+- **Notificación/alertas de estados FAILED:** No existen TC para verificar que el sistema notifique o alerte (email, dashboard, webhook) cuando un faltante transita a FAILED (ej. `max_reposition_cycles_exceeded`, `curso no habilitado`). La constitución exige que las condiciones de fallo permanente sean detectables y trazables por el equipo de operaciones (constitution.md:96-97).
+- **Migración de datos preexistentes:** No se cubre el comportamiento del sistema con registros de faltantes creados antes de la activación de esta funcionalidad. La constitución exige definir y probar el comportamiento con datos preexistentes (constitution.md:101). ¿Deben procesarse retroactivamente o solo aplica a nuevos registros? Se creará TC-33 en Fase 2.
+- **Rotura-11 y Rotura-12 sin definir:** El documento afirma 14 roturas detectadas en grilling, pero solo 12 están identificadas en la matriz. Rotura-11 y Rotura-12 requieren definición por parte del equipo (QA + Tech Lead + PO). Ver notas al final del documento.
 
 ---
 
@@ -78,11 +84,12 @@ Las pruebas se ejecutan en entornos aislados. La API de NQ se simula (mocks) par
 | Atributo | Valor |
 |----------|-------|
 | Prioridad | P1 |
-| Traces To | HU-1, AC-6 |
+| Traces To | HU-1, AC-6 / Plan §1 (delay fijo configurable entre requests) |
 
 **Given:** Un registro de faltante que requiere 12 preguntas para completar stock.
 **When:** El `GenerationJob` inicia el procesamiento y la API de NQ tiene límite de 5 preguntas por petición.
-**Then:** El sistema divide la solicitud en 3 peticiones: bloque 1 (5), bloque 2 (5), bloque 3 (2). Se respeta el límite de 5 por transacción.
+**Then:** El sistema divide la solicitud en 3 peticiones: bloque 1 (5), bloque 2 (5), bloque 3 (2). Se respeta el límite de 5 por transacción. Entre cada petición se aplica el delay fijo configurable definido en el plan técnico.
+**Verificación:** `NQClient::post` invocado exactamente 3 veces con `quantity = 5, 5, 2` respectivamente. Timestamps de invocación (`t1`, `t2`, `t3`) cumplen `t2 - t1 ≥ delay_configurado` y `t3 - t2 ≥ delay_configurado`. `SELECT COUNT(*) FROM nq_api_logs WHERE faltante_id = F1` = 3.
 
 ---
 
@@ -278,12 +285,13 @@ Las pruebas se ejecutan en entornos aislados. La API de NQ se simula (mocks) par
 | Prioridad | P1 |
 | Traces To | Constitution Art. 7 / Plan §2 |
 
-**Given:** Tres escenarios: (a) flujo exitoso sin duplicados, (b) flujo con reposición por duplicados, (c) error permanente.
+**Given:** Cuatro escenarios: (a) flujo exitoso sin duplicados, (b) flujo con reposición por duplicados, (c) error permanente, (d) curso deshabilitado en NQ.
 **When:** Se ejecuta cada escenario de principio a fin.
 **Then:**
 - **(a) Sin duplicados:** `PENDING → PROCESSING → COMPLETED`. No existe `PENDING → COMPLETED` sin `PROCESSING`.
 - **(b) Con reposición:** `PENDING → PROCESSING → PARTIAL → PROCESSING → COMPLETED`. No existe `PARTIAL → COMPLETED` sin `PROCESSING` intermedio.
 - **(c) Error permanente:** `PENDING → PROCESSING → FAILED`. No existe `PENDING → FAILED` sin `PROCESSING`.
+- **(d) Curso deshabilitado en NQ:** `PENDING → PROCESSING → CANCELLED`. No existe `PENDING → CANCELLED` sin `PROCESSING`. `CANCELLED` es estado terminal (no se re-procesa automáticamente).
 - Verificación para todos: `SELECT estado FROM process_traces WHERE faltante_id = F1 ORDER BY timestamp ASC`. Estados consecutivos con timestamps incrementales (`t1 < t2 < t3`).
 
 ---
@@ -295,23 +303,26 @@ Las pruebas se ejecutan en entornos aislados. La API de NQ se simula (mocks) par
 | Prioridad | P1 |
 | Traces To | Constitution Art. 3 |
 
-**Given:** Cuatro escenarios de faltante ya procesado: `F_COMPLETED`, `F_FAILED`, `F_PARTIAL`, `F_PROCESSING`.
+**Given:** Cinco escenarios de faltante ya procesado: `F_COMPLETED`, `F_FAILED`, `F_CANCELLED`, `F_PARTIAL`, `F_PROCESSING`.
 **When:** Se intenta ejecutar un segundo `GenerationJob` para cada uno (por duplicado en cola o reintento espurio).
 **Then:**
 - `F_COMPLETED`: Job B detecta `estado = COMPLETED` → early return. `NQClient::post` no invocado.
 - `F_FAILED`: Job B detecta `estado = FAILED` → early return. No se reintenta automáticamente.
+- `F_CANCELLED`: Job B detecta `estado = CANCELLED` → early return. No se reintenta automáticamente.
 - `F_PARTIAL`: Job B detecta `estado = PARTIAL` → early return (PARTIAL es bloqueante, TC-09).
 - `F_PROCESSING`: Job B detecta `estado = PROCESSING` → early return (PROCESSING es bloqueante, TC-09).
 - En ningún caso se duplica `generated_quantity` ni se envían solicitudes adicionales a NQ. Verificación: `NQClient::post` no invocado para ninguno. `generated_quantity` sin cambio.
 
 ---
 
-### TC-18 · ODISEO_KEY no expuesta en logs — todos los niveles de log
+### TC-18 · ODISEO_KEY no expuesta en logs — todos los niveles de log (Parte A: ofuscación de secretos)
 
 | Atributo | Valor |
 |----------|-------|
 | Prioridad | P1 |
 | Traces To | Constitution Art. 2 |
+
+> **Nota:** Este TC cubre únicamente la ofuscación del secreto en logs y stack traces. El comportamiento completo del sistema ante HTTP 401/403 (transición de estado, reintentos, registro de auditoría) se cubrirá en TC-28 (Fase 2).
 
 **Given:** `GenerationJob` ejecuta flujo exitoso (`HTTP 200`) y también falla con error `HTTP 401`. `ODISEO_KEY` está configurada en `.env`.
 **When:** El sistema registra logs en ambos escenarios (info en éxito, error en fallo). Se inspeccionan `storage/logs/laravel.log`, stack traces de Sentry y headers de requests logueados.
@@ -515,7 +526,7 @@ Las pruebas se ejecutan en entornos aislados. La API de NQ se simula (mocks) par
 | HU-1 AC-4 — Cursos habilitados | TC-04, TC-10 | ✅ |
 | HU-1 AC-5 — Atributos payload | TC-04 | ✅ |
 | HU-1 AC-6 — División por bloques | TC-02, TC-20 | ✅ |
-| HU-1 AC-7 — API existente NQ | TC-01, TC-02, TC-05 | ✅ |
+| HU-1 AC-7 — API existente NQ | TC-01, TC-05 | ✅ |
 | HU-1 AC-8 — Error → PENDING | TC-11 | ✅ |
 | HU-2 AC-1 — Recepción automática | TC-05 | ✅ |
 | HU-2 AC-2 — Validación duplicidad | TC-05, TC-08, TC-22 | ✅ |
@@ -541,31 +552,30 @@ Las pruebas se ejecutan en entornos aislados. La API de NQ se simula (mocks) par
 | Rotura-1 — Doble encolado concurrente | TC-15 | ✅ |
 | Rotura-2 — PARTIAL bloqueante | TC-09 | ✅ |
 | Rotura-3 — Límite 3 ciclos reposición | TC-08 | ✅ |
+| Rotura-4 — Stale job recovery | TC-23 | ✅ |
 | Rotura-5 — Descarte respuesta NQ en fallo BD | TC-13 | ✅ |
 | Rotura-6 — Idempotencia extendida | TC-17 | ✅ |
 | Rotura-7 — FIFO conserva timestamp | TC-03 | ✅ |
 | Rotura-8 — ODISEO_KEY en todos los logs | TC-18 | ✅ |
 | Rotura-9 — División reposición > 5 | TC-20 | ✅ |
 | Rotura-10 — Ciclos de estado alternos | TC-16 | ✅ |
+| Rotura-11 — Pendiente de definición | — | ⚠️ Sin TC |
+| Rotura-12 — Pendiente de definición | — | ⚠️ Sin TC |
 | Rotura-14 — Sanitización contenido NQ | TC-21 | ✅ |
-| Rotura-4 — Stale job recovery | TC-23 | ✅ |
 | NQ devuelve menos preguntas de las solicitadas | TC-24 | ✅ |
 | PARTIAL + error NQ incrementa reposition_cycles | TC-25 | ✅ |
 | Máximo 3 reintentos por ciclo NQ 5xx | TC-26 | ✅ |
 | Cache respuesta NQ en fallo BD | TC-27 | ✅ |
-| HU-2 AC-9 — Máx 3 ciclos reposición | TC-08, TC-25 | ✅ |
-| NFR-4 — Latencia job < 1s | TC-31 | ✅ |
-| NFR-5 — HTTP 429 (Rate Limiting) | TC-28 | ✅ |
-| NFR-6 — Connection/Read timeout | TC-29 | ✅ |
-| Redis indisponible | TC-30 | ✅ |
-| Carga/volumen (5000 registros FIFO) | TC-31 | ✅ |
 
 ---
 
 ## Notas para el equipo
 
 - **Rotura-4 (stale jobs):** Mitigado mediante scheduled command `faltantes:recover-stale`. Comando programado (cron) ejecutado cada 5 minutos detecta faltantes en `PROCESSING` con `updated_at > 30 min` y los devuelve a `PENDING` (ver TC-23).
+- **Rotura-11 y Rotura-12:** Detectadas en sesión de grilling pero no definidas en la matriz de trazabilidad. El equipo (QA + Tech Lead + PO) debe definir ambos riesgos y asignarles TC correspondiente o documentar su exclusión justificada (similar a Rotura-13).
 - **Rotura-13 (HTTP response al usuario):** El endpoint de generación de material es preexistente y no forma parte de esta implementación.
+- **TC pendientes (Fase 2):** Se crearán TC-28 (HTTP 4xx → FAILED inmediato), TC-29 (timeout HTTP), TC-30 (Redis indisponible), TC-31 (HTTP 429 rate limiting), TC-32 (carga/volumen FIFO) y TC-33 (datos preexistentes / migración) para cubrir los gaps identificados en "Qué quedó sin cubrir" y satisfacer los requisitos de la constitución (Art. 6.3-6.7).
+- **Decisiones pendientes (Fase 1):** Quedan 4 contradicciones entre spec/plan/test-cases que requieren resolución del equipo: (1) consolidación vs no consolidación de registros repetidos, (2) CANCELLED vs FAILED para curso no habilitado en NQ, (3) PENDING vs FAILED al agotar reintentos, (4) re-procesamiento automático de registros FAILED. Ver plan de acción.
 
 ---
 
